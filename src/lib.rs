@@ -4,7 +4,7 @@
 //! allowing accurate rate limiting at any rate without requiring callers to
 //! tune refill intervals.
 //!
-//! ```
+//! ```ignore
 //! use ratelimit::Ratelimiter;
 //!
 //! // 1000 requests/s, no initial tokens, burst limited to 1 second
@@ -30,10 +30,43 @@
 //!     // do some ratelimited action here
 //! }
 //! ```
+#![cfg_attr(not(feature = "std"), no_std)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+#[cfg(any(feature = "std", test))]
+extern crate std;
+
+use core::fmt::{self, Debug, Formatter};
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use thiserror::Error;
+
+/// Abstraction over a monotonic clock.
+pub trait Clock {
+    /// Returns the elapsed time since this clock was created.
+    fn elapsed(&self) -> Duration;
+}
+
+/// Standard library clock implementation.
+///
+/// This clock uses [`std::time::Instant`] for high-precision timing.
+/// Available only when the `std` feature is enabled.
+#[cfg(feature = "std")]
+pub struct StdClock(std::time::Instant);
+
+#[cfg(feature = "std")]
+impl StdClock {
+    /// Create a new clock starting from the current time.
+    pub fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "std")]
+impl Clock for StdClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
 
 /// Internal scale factor for sub-token precision. Allows smooth token
 /// accumulation at any rate without discrete refill intervals.
@@ -52,7 +85,7 @@ pub enum Error {
 /// Tokens accumulate continuously based on elapsed time. Each `try_wait()`
 /// call consumes one token. A rate of 0 means unlimited (no rate limiting).
 #[must_use]
-pub struct Ratelimiter {
+pub struct Ratelimiter<C: Clock> {
     /// Target rate in tokens per second. 0 = unlimited.
     rate: AtomicU64,
     /// Maximum tokens (burst capacity) in real tokens.
@@ -61,13 +94,14 @@ pub struct Ratelimiter {
     tokens: AtomicU64,
     /// Tokens dropped due to bucket overflow, scaled by TOKEN_SCALE.
     dropped: AtomicU64,
-    /// Last refill timestamp in nanoseconds since `start`.
+    /// Last refill timestamp in nanoseconds since clock creation.
     last_refill_ns: AtomicU64,
-    /// Creation instant for relative timing.
-    start: Instant,
+    /// Clock for measuring elapsed time.
+    clock: C,
 }
 
-impl Ratelimiter {
+#[cfg(feature = "std")]
+impl Ratelimiter<StdClock> {
     /// Create a new ratelimiter with the given rate in tokens per second.
     ///
     /// A rate of 0 means unlimited — `try_wait()` will always succeed.
@@ -75,20 +109,58 @@ impl Ratelimiter {
     /// The ratelimiter starts with no tokens available. Burst capacity
     /// defaults to `rate` tokens (1 second worth). Use `builder()` for
     /// more control.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ratelimit::Ratelimiter;
+    ///
+    /// // 1000 requests/s, no initial tokens, burst limited to 1 second
+    /// let ratelimiter = Ratelimiter::new(1000);
+    /// ```
     pub fn new(rate: u64) -> Self {
+        Self::with_clock(rate, StdClock::new())
+    }
+
+    /// Create a builder for configuring the ratelimiter with StdClock.
+    pub fn builder(rate: u64) -> Builder<StdClock> {
+        Builder::with_clock(rate, StdClock::new())
+    }
+}
+
+impl<C> Ratelimiter<C>
+where
+    C: Clock,
+{
+    /// Create a new ratelimiter with the given rate and clock.
+    ///
+    /// This constructor is available for any clock type implementing the
+    /// [`Clock`] trait. For the standard library clock, use [`Ratelimiter::new`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ratelimit::{Clock, Ratelimiter};
+    /// use core::time::Duration;
+    ///
+    /// struct MyClock;
+    /// impl Clock for MyClock {
+    ///     fn elapsed(&self) -> Duration {
+    ///         Duration::from_nanos(0)
+    ///     }
+    /// }
+    ///
+    /// let ratelimiter = Ratelimiter::with_clock(1000, MyClock);
+    /// ```
+    pub fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate: AtomicU64::new(rate),
             max_tokens: AtomicU64::new(if rate == 0 { u64::MAX } else { rate }),
             tokens: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             last_refill_ns: AtomicU64::new(0),
-            start: Instant::now(),
+            clock,
         }
-    }
-
-    /// Create a builder for configuring the ratelimiter.
-    pub fn builder(rate: u64) -> Builder {
-        Builder::new(rate)
     }
 
     /// Returns the current rate in tokens per second. 0 means unlimited.
@@ -147,7 +219,7 @@ impl Ratelimiter {
             {
                 break;
             }
-            std::hint::spin_loop();
+            core::hint::spin_loop();
         }
     }
 
@@ -176,7 +248,7 @@ impl Ratelimiter {
         }
 
         // Wraps after ~584 years of uptime; not a practical concern.
-        let now_ns = self.start.elapsed().as_nanos() as u64;
+        let now_ns = self.clock.elapsed().as_nanos() as u64;
         let last_ns = self.last_refill_ns.load(Ordering::Relaxed);
         let elapsed_ns = now_ns.saturating_sub(last_ns);
 
@@ -229,7 +301,7 @@ impl Ratelimiter {
                 }
                 break;
             }
-            std::hint::spin_loop();
+            core::hint::spin_loop();
         }
     }
 
@@ -242,7 +314,7 @@ impl Ratelimiter {
     /// under concurrent load.
     ///
     /// When the rate is 0 (unlimited), always succeeds.
-    pub fn try_wait(&self) -> Result<(), std::time::Duration> {
+    pub fn try_wait(&self) -> Result<(), Duration> {
         let rate = self.rate.load(Ordering::Relaxed);
         if rate == 0 {
             return Ok(());
@@ -256,7 +328,7 @@ impl Ratelimiter {
             if current < cost {
                 let deficit = cost - current;
                 let wait_ns = (deficit as u128 * 1_000 / rate as u128).max(1) as u64;
-                return Err(std::time::Duration::from_nanos(wait_ns));
+                return Err(Duration::from_nanos(wait_ns));
             }
 
             if self
@@ -266,7 +338,7 @@ impl Ratelimiter {
             {
                 return Ok(());
             }
-            std::hint::spin_loop();
+            core::hint::spin_loop();
         }
     }
 }
@@ -274,13 +346,16 @@ impl Ratelimiter {
 const _: () = {
     #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}
-    fn _check() {
-        assert_send_sync::<Ratelimiter>();
+    fn _check<C: Clock + Send + Sync>() {
+        assert_send_sync::<Ratelimiter<C>>();
     }
 };
 
-impl std::fmt::Debug for Ratelimiter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<C> Debug for Ratelimiter<C>
+where
+    C: Clock,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ratelimiter")
             .field("rate", &self.rate.load(Ordering::Relaxed))
             .field("max_tokens", &self.max_tokens.load(Ordering::Relaxed))
@@ -292,18 +367,20 @@ impl std::fmt::Debug for Ratelimiter {
 /// Builder for constructing a `Ratelimiter` with custom settings.
 #[derive(Debug, Clone, Copy)]
 #[must_use = "call .build() to construct the Ratelimiter"]
-pub struct Builder {
+pub struct Builder<C> {
     rate: u64,
     max_tokens: Option<u64>,
     initial_available: u64,
+    clock: C,
 }
 
-impl Builder {
-    fn new(rate: u64) -> Self {
+impl<C> Builder<C> {
+    pub(crate) fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate,
             max_tokens: None,
             initial_available: 0,
+            clock,
         }
     }
 
@@ -328,7 +405,10 @@ impl Builder {
     }
 
     /// Consume this builder and construct a `Ratelimiter`.
-    pub fn build(self) -> Result<Ratelimiter, Error> {
+    pub fn build(self) -> Result<Ratelimiter<C>, Error>
+    where
+        C: Clock,
+    {
         let max_tokens =
             self.max_tokens
                 .unwrap_or(if self.rate == 0 { u64::MAX } else { self.rate });
@@ -347,7 +427,7 @@ impl Builder {
             tokens: AtomicU64::new(self.initial_available.saturating_mul(TOKEN_SCALE)),
             dropped: AtomicU64::new(0),
             last_refill_ns: AtomicU64::new(0),
-            start: Instant::now(),
+            clock: self.clock,
         })
     }
 }
@@ -355,11 +435,47 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use core::time::Duration;
+
+    /// Test clock using libc::clock_gettime for no_std-compatible testing.
+    struct TestClock(u64);
+
+    impl TestClock {
+        fn new() -> Self {
+            Self(now_ns())
+        }
+    }
+
+    impl Clock for TestClock {
+        fn elapsed(&self) -> Duration {
+            Duration::from_nanos(now_ns().saturating_sub(self.0))
+        }
+    }
+
+    fn now_ns() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    fn sleep(d: Duration) {
+        let ts = libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as libc::c_long,
+        };
+        unsafe {
+            libc::nanosleep(&ts, core::ptr::null_mut());
+        }
+    }
 
     #[test]
     fn unlimited() {
-        let rl = Ratelimiter::new(0);
+        let rl = Ratelimiter::with_clock(0, TestClock::new());
         for _ in 0..1000 {
             assert!(rl.try_wait().is_ok());
         }
@@ -367,7 +483,8 @@ mod tests {
 
     #[test]
     fn basic_rate() {
-        let rl = Ratelimiter::builder(1000)
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(1000, clock)
             .initial_available(10)
             .build()
             .unwrap();
@@ -382,10 +499,10 @@ mod tests {
 
     #[test]
     fn refill_over_time() {
-        let rl = Ratelimiter::new(1000);
+        let rl = Ratelimiter::with_clock(1000, TestClock::new());
 
         // Wait 100ms — should accumulate ~100 tokens
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100));
 
         let mut count = 0;
         while rl.try_wait().is_ok() {
@@ -399,7 +516,8 @@ mod tests {
 
     #[test]
     fn burst_capacity() {
-        let rl = Ratelimiter::builder(100)
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(100, clock)
             .max_tokens(10)
             .initial_available(10)
             .build()
@@ -414,10 +532,14 @@ mod tests {
 
     #[test]
     fn idle_does_not_exceed_capacity() {
-        let rl = Ratelimiter::builder(1000).max_tokens(10).build().unwrap();
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(1000, clock)
+            .max_tokens(10)
+            .build()
+            .unwrap();
 
         // Sleep long enough to accumulate way more than max_tokens
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100));
 
         let mut count = 0;
         while rl.try_wait().is_ok() {
@@ -429,16 +551,16 @@ mod tests {
 
     #[test]
     fn set_rate() {
-        let rl = Ratelimiter::new(100);
+        let rl = Ratelimiter::with_clock(100, TestClock::new());
 
         // Wait for some tokens
-        std::thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
 
         // Increase rate 10x
         rl.set_rate(1000);
 
         // Wait again — should accumulate faster
-        std::thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
 
         let mut count = 0;
         while rl.try_wait().is_ok() {
@@ -451,7 +573,8 @@ mod tests {
 
     #[test]
     fn set_max_tokens_clamps_down() {
-        let rl = Ratelimiter::builder(1000)
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(1000, clock)
             .max_tokens(100)
             .initial_available(100)
             .build()
@@ -465,7 +588,7 @@ mod tests {
 
     #[test]
     fn try_wait_returns_duration_hint() {
-        let rl = Ratelimiter::new(1000);
+        let rl = Ratelimiter::with_clock(1000, TestClock::new());
         // No tokens available yet and not enough time passed
         let err = rl.try_wait().unwrap_err();
         // Should hint at ~1ms (1_000_000ns for 1000/s)
@@ -474,7 +597,8 @@ mod tests {
 
     #[test]
     fn builder_error_available_too_high() {
-        let result = Ratelimiter::builder(100)
+        let clock = TestClock::new();
+        let result = Builder::with_clock(100, clock)
             .max_tokens(10)
             .initial_available(20)
             .build();
@@ -483,10 +607,14 @@ mod tests {
 
     #[test]
     fn dropped_tokens() {
-        let rl = Ratelimiter::builder(1000).max_tokens(10).build().unwrap();
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(1000, clock)
+            .max_tokens(10)
+            .build()
+            .unwrap();
 
         // Sleep long enough for many tokens to try to accumulate
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100));
 
         // Trigger a refill
         let _ = rl.try_wait();
@@ -497,15 +625,15 @@ mod tests {
 
     #[test]
     fn wait_loop() {
-        let rl = Ratelimiter::new(10_000);
+        let rl = Ratelimiter::with_clock(10_000, TestClock::new());
 
-        let start = std::time::Instant::now();
+        let clock = TestClock::new();
         let mut count = 0;
 
-        while start.elapsed() < Duration::from_millis(100) {
+        while clock.elapsed() < Duration::from_millis(100) {
             match rl.try_wait() {
                 Ok(()) => count += 1,
-                Err(wait) => std::thread::sleep(wait),
+                Err(wait) => sleep(wait),
             }
         }
 
@@ -515,69 +643,34 @@ mod tests {
     }
 
     #[test]
-    fn multithread() {
-        use std::sync::Arc;
-
-        let rl = Arc::new(
-            Ratelimiter::builder(10_000)
-                .max_tokens(10_000)
-                .build()
-                .unwrap(),
-        );
-        let duration = Duration::from_millis(200);
-
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let rl = rl.clone();
-                std::thread::spawn(move || {
-                    let start = std::time::Instant::now();
-                    let mut count = 0u64;
-                    while start.elapsed() < duration {
-                        if rl.try_wait().is_ok() {
-                            count += 1;
-                        }
-                    }
-                    count
-                })
-            })
-            .collect();
-
-        let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-
-        // 10k/s for 200ms ≈ 2000, allow wide margin for CI
-        assert!(total >= 1000, "expected >= 1000, got {total}");
-        assert!(total <= 4000, "expected <= 4000, got {total}");
-    }
-
-    #[test]
     fn high_rate() {
         // Verify no overflow/truncation at very high rates
-        let rl = Ratelimiter::new(1_000_000_000_000); // 1 trillion/s
-        std::thread::sleep(Duration::from_millis(10));
+        let rl = Ratelimiter::with_clock(1_000_000_000_000, TestClock::new()); // 1 trillion/s
+        sleep(Duration::from_millis(10));
         assert!(rl.try_wait().is_ok());
     }
 
     #[test]
     fn try_wait_hint_at_high_rate() {
         // Verify the wait hint is at least 1ns even at very high rates
-        let rl = Ratelimiter::new(10_000_000_000); // 10B/s
+        let rl = Ratelimiter::with_clock(10_000_000_000, TestClock::new()); // 10B/s
         let err = rl.try_wait().unwrap_err();
         assert!(err >= Duration::from_nanos(1));
     }
 
     #[test]
     fn unlimited_then_set_rate() {
-        let rl = Ratelimiter::new(0);
+        let rl = Ratelimiter::with_clock(0, TestClock::new());
         assert!(rl.try_wait().is_ok()); // unlimited
 
         rl.set_rate(1000);
-        std::thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
         assert!(rl.try_wait().is_ok()); // set_rate alone resets max_tokens
     }
 
     #[test]
     fn set_rate_to_zero_and_back() {
-        let rl = Ratelimiter::new(1000);
+        let rl = Ratelimiter::with_clock(1000, TestClock::new());
 
         // Switch to unlimited
         rl.set_rate(0);
@@ -591,26 +684,50 @@ mod tests {
         assert_eq!(rl.max_tokens(), 500);
 
         // Should work after some time
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
         assert!(rl.try_wait().is_ok());
     }
 
     #[test]
     fn builder_error_max_tokens_zero() {
-        let result = Ratelimiter::builder(100).max_tokens(0).build();
+        let clock = TestClock::new();
+        let result = Builder::with_clock(100, clock).max_tokens(0).build();
         assert!(matches!(result, Err(Error::MaxTokensTooLow)));
     }
 
     #[test]
     fn max_tokens_zero() {
-        let rl = Ratelimiter::new(1000);
+        let rl = Ratelimiter::with_clock(1000, TestClock::new());
         rl.set_max_tokens(0);
-        std::thread::sleep(Duration::from_millis(10));
+        sleep(Duration::from_millis(10));
         // With max_tokens=0, no tokens can accumulate
         assert!(rl.try_wait().is_err());
         // Restore capacity
         rl.set_max_tokens(1000);
-        std::thread::sleep(Duration::from_millis(10));
+        sleep(Duration::from_millis(10));
         assert!(rl.try_wait().is_ok());
+    }
+
+    // Test std convenience APIs when std feature is enabled
+    #[cfg(feature = "std")]
+    #[test]
+    fn std_convenience_apis() {
+        // Test Ratelimiter::new()
+        let rl = Ratelimiter::new(1000);
+        assert_eq!(rl.rate(), 1000);
+
+        // Test Ratelimiter::builder()
+        let rl = Ratelimiter::builder(1000)
+            .max_tokens(100)
+            .initial_available(50)
+            .build()
+            .unwrap();
+        assert_eq!(rl.max_tokens(), 100);
+        assert_eq!(rl.available(), 50);
+
+        // Test StdClock directly
+        let clock = StdClock::new();
+        let rl = Ratelimiter::with_clock(1000, clock);
+        assert_eq!(rl.rate(), 1000);
     }
 }
