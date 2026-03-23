@@ -4,7 +4,12 @@
 //! allowing accurate rate limiting at any rate without requiring callers to
 //! tune refill intervals.
 //!
-//! ```ignore
+//! The `std` feature is enabled by default and provides [`StdClock`],
+//! [`Ratelimiter::new`], and [`Ratelimiter::builder`]. Disable default
+//! features to use the crate in `no_std` environments and supply your own
+//! [`Clock`].
+//!
+//! ```no_run
 //! use ratelimit::Ratelimiter;
 //!
 //! // 1000 requests/s, no initial tokens, burst limited to 1 second
@@ -30,6 +35,22 @@
 //!     // do some ratelimited action here
 //! }
 //! ```
+//!
+//! ```
+//! use core::time::Duration;
+//! use ratelimit::{Clock, Ratelimiter};
+//!
+//! struct FixedClock;
+//!
+//! impl Clock for FixedClock {
+//!     fn elapsed(&self) -> Duration {
+//!         Duration::from_millis(10)
+//!     }
+//! }
+//!
+//! let ratelimiter = Ratelimiter::with_clock(1000, FixedClock);
+//! assert!(ratelimiter.try_wait().is_ok());
+//! ```
 #![no_std]
 
 #[cfg(any(feature = "std", test))]
@@ -49,7 +70,7 @@ pub trait Clock {
 /// Standard library clock implementation.
 ///
 /// This clock uses [`std::time::Instant`] for high-precision timing.
-/// Available only when the `std` feature is enabled.
+/// Available only when the `std` feature is enabled, which it is by default.
 #[cfg(feature = "std")]
 pub struct StdClock(std::time::Instant);
 
@@ -110,6 +131,9 @@ impl Ratelimiter<StdClock> {
     /// defaults to `rate` tokens (1 second worth). Use `builder()` for
     /// more control.
     ///
+    /// Available only when the `std` feature is enabled, which it is by
+    /// default.
+    ///
     /// # Example
     ///
     /// ```
@@ -123,6 +147,9 @@ impl Ratelimiter<StdClock> {
     }
 
     /// Create a builder for configuring the ratelimiter with StdClock.
+    ///
+    /// Available only when the `std` feature is enabled, which it is by
+    /// default.
     pub fn builder(rate: u64) -> Builder<StdClock> {
         Builder::with_clock(rate, StdClock::new())
     }
@@ -135,7 +162,8 @@ where
     /// Create a new ratelimiter with the given rate and clock.
     ///
     /// This constructor is available for any clock type implementing the
-    /// [`Clock`] trait. For the standard library clock, use [`Ratelimiter::new`].
+    /// [`Clock`] trait. This is the constructor to use in `no_std`
+    /// environments. For the standard library clock, use [`Ratelimiter::new`].
     ///
     /// # Example
     ///

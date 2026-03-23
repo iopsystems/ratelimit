@@ -16,6 +16,9 @@ ratelimit = { version = "1", default-features = false }
 
 ## Usage
 
+`Ratelimiter::new`, `Ratelimiter::builder`, and `StdClock` are available with
+the default `std` feature.
+
 ```rust
 use ratelimit::Ratelimiter;
 
@@ -59,6 +62,26 @@ ratelimiter.set_rate(5_000);
 ```
 
 A rate of 0 means unlimited -- `try_wait()` will always succeed.
+
+## no_std
+
+Disable default features and provide your own monotonic clock:
+
+```rust
+use core::time::Duration;
+use ratelimit::{Clock, Ratelimiter};
+
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+}
+
+let ratelimiter = Ratelimiter::with_clock(1_000, FixedClock);
+assert!(ratelimiter.try_wait().is_ok());
+```
 
 ## Design
 
