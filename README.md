@@ -68,6 +68,31 @@ Key parameters:
   (1 second of burst).
 - **initial available** -- tokens available at construction. Defaults to 0.
 
+## Migration from `0.10.x`
+
+Before :
+
+```rust
+use ratelimit::Ratelimiter;
+use std::time::Duration;
+
+// 8 requests/s
+let ratelimiter = Ratelimiter::builder(8, Duration::from_secs(1))
+    .build()
+    .unwrap();
+```
+
+After:
+
+```rust
+use ratelimit::Ratelimiter;
+
+// 8 requests/s
+let ratelimiter = Ratelimiter::builder(8)
+    .build()
+    .unwrap();
+```
+
 ## Links
 
 - [API Documentation (docs.rs)](https://docs.rs/ratelimit/)
