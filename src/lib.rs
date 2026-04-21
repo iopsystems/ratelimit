@@ -83,6 +83,13 @@ impl StdClock {
 }
 
 #[cfg(feature = "std")]
+impl Default for StdClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
 impl Clock for StdClock {
     fn elapsed(&self) -> Duration {
         self.0.elapsed()
@@ -468,8 +475,12 @@ pub struct Builder<C> {
 }
 
 impl<C> Builder<C> {
-    #[cfg_attr(not(any(feature = "std", test)), allow(dead_code))]
-    pub(crate) fn with_clock(rate: u64, clock: C) -> Self {
+    /// Create a builder configured with the given rate and clock.
+    ///
+    /// This is the builder constructor for `no_std` environments or for any
+    /// caller that wants to supply a custom [`Clock`]. For the standard
+    /// library clock, use [`Ratelimiter::builder`].
+    pub fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate,
             max_tokens: None,
