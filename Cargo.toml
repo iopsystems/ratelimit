@@ -12,5 +12,9 @@ keywords = ["ratelimit", "token-bucket", "rate-limiter", "throttle", "concurrenc
 categories = ["concurrency", "algorithms"]
 rust-version = "1.85"
 
+[features]
+default = ["std"]
+std = []
+
 [dependencies]
-thiserror = "2.0"
+thiserror = { version = "2.0", default-features = false }
