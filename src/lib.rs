@@ -356,6 +356,20 @@ where
         self.period_ns.store(ns.max(1), Ordering::Release);
     }
 
+    /// Set rate and period together, atomically relative to `try_wait*`.
+    ///
+    /// Equivalent to calling [`set_period`](Ratelimiter::set_period) and
+    /// then [`set_rate`](Ratelimiter::set_rate), but period is stored
+    /// before rate so concurrent readers never observe a mismatched
+    /// intermediate configuration (e.g. the old rate at the new period).
+    ///
+    /// A zero-length period is silently clamped to 1 nanosecond.
+    pub fn set_rate_per(&self, rate: u64, period: Duration) {
+        let ns = period.as_nanos().min(u64::MAX as u128) as u64;
+        self.period_ns.store(ns.max(1), Ordering::Release);
+        self.set_rate(rate);
+    }
+
     /// Returns the approximate number of tokens currently available.
     ///
     /// This value is not updated automatically — tokens only accumulate
@@ -1096,5 +1110,23 @@ mod tests {
             .period(Duration::ZERO)
             .build();
         assert!(matches!(result, Err(Error::PeriodTooShort)));
+    }
+
+    #[test]
+    fn set_rate_per_updates_both() {
+        let clock = TestClock::new();
+        let rl = Ratelimiter::with_clock(1000, clock.clone());
+
+        // Switch to 5 per hour.
+        rl.set_rate_per(5, Duration::from_secs(3600));
+        assert_eq!(rl.rate(), 5);
+        assert_eq!(rl.period(), Duration::from_secs(3600));
+
+        // One hour elapsed produces 5 tokens at the new config.
+        clock.advance(Duration::from_secs(3600));
+        for _ in 0..5 {
+            assert!(rl.try_wait().is_ok());
+        }
+        assert!(rl.try_wait().is_err());
     }
 }
