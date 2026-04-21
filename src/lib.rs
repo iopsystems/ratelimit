@@ -107,6 +107,7 @@ impl Clock for StdClock {
 const TOKEN_SCALE: u64 = 1_000_000;
 
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("initial available tokens cannot exceed max tokens")]
     AvailableTokensTooHigh,
@@ -116,8 +117,9 @@ pub enum Error {
     PeriodTooShort,
 }
 
-/// Failure modes for [`Ratelimiter::try_wait_n`].
+/// Failure modes for [`Ratelimiter::try_wait`] and [`Ratelimiter::try_wait_n`].
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TryWaitError {
     /// Not enough tokens are available right now. Retry after the returned
     /// duration — same semantics as the `Err` from [`Ratelimiter::try_wait`].
