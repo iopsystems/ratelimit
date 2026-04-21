@@ -83,6 +83,13 @@ impl StdClock {
 }
 
 #[cfg(feature = "std")]
+impl Default for StdClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
 impl Clock for StdClock {
     fn elapsed(&self) -> Duration {
         self.0.elapsed()
@@ -119,7 +126,29 @@ pub enum TryWaitError {
 ///
 /// Tokens accumulate continuously based on elapsed time. Each `try_wait()`
 /// call consumes one token. A rate of 0 means unlimited (no rate limiting).
+///
+/// The `C` type parameter defaults to [`StdClock`] when the `std` feature
+/// is enabled, so `Ratelimiter` without generics resolves to the standard
+/// configuration. In `no_std` builds the clock must be specified.
 #[must_use]
+#[cfg(feature = "std")]
+pub struct Ratelimiter<C: Clock = StdClock> {
+    /// Target rate in tokens per second. 0 = unlimited.
+    rate: AtomicU64,
+    /// Maximum tokens (burst capacity) in real tokens.
+    max_tokens: AtomicU64,
+    /// Available tokens, scaled by TOKEN_SCALE for sub-token precision.
+    tokens: AtomicU64,
+    /// Tokens dropped due to bucket overflow, scaled by TOKEN_SCALE.
+    dropped: AtomicU64,
+    /// Last refill timestamp in nanoseconds since clock creation.
+    last_refill_ns: AtomicU64,
+    /// Clock for measuring elapsed time.
+    clock: C,
+}
+
+#[must_use]
+#[cfg(not(feature = "std"))]
 pub struct Ratelimiter<C: Clock> {
     /// Target rate in tokens per second. 0 = unlimited.
     rate: AtomicU64,
@@ -458,8 +487,22 @@ where
 }
 
 /// Builder for constructing a `Ratelimiter` with custom settings.
+///
+/// The `C` type parameter defaults to [`StdClock`] when the `std` feature
+/// is enabled, matching [`Ratelimiter`]'s default.
 #[derive(Debug, Clone, Copy)]
 #[must_use = "call .build() to construct the Ratelimiter"]
+#[cfg(feature = "std")]
+pub struct Builder<C = StdClock> {
+    rate: u64,
+    max_tokens: Option<u64>,
+    initial_available: u64,
+    clock: C,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[must_use = "call .build() to construct the Ratelimiter"]
+#[cfg(not(feature = "std"))]
 pub struct Builder<C> {
     rate: u64,
     max_tokens: Option<u64>,
@@ -468,8 +511,12 @@ pub struct Builder<C> {
 }
 
 impl<C> Builder<C> {
-    #[cfg_attr(not(any(feature = "std", test)), allow(dead_code))]
-    pub(crate) fn with_clock(rate: u64, clock: C) -> Self {
+    /// Create a builder configured with the given rate and clock.
+    ///
+    /// This is the builder constructor for `no_std` environments or for any
+    /// caller that wants to supply a custom [`Clock`]. For the standard
+    /// library clock, use [`Ratelimiter::builder`].
+    pub fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate,
             max_tokens: None,
@@ -818,6 +865,19 @@ mod tests {
         let clock = StdClock::new();
         let rl = Ratelimiter::with_clock(1000, clock);
         assert_eq!(rl.rate(), 1000);
+    }
+
+    // Proves the `C: Clock = StdClock` default works in type position —
+    // callers can name `Ratelimiter` / `Builder` without generics.
+    #[cfg(feature = "std")]
+    #[test]
+    fn type_default_clock() {
+        let rl: Ratelimiter = Ratelimiter::new(1000);
+        assert_eq!(rl.rate(), 1000);
+
+        let b: Builder = Ratelimiter::builder(1000);
+        let rl = b.max_tokens(10).build().unwrap();
+        assert_eq!(rl.max_tokens(), 10);
     }
 
     #[cfg(feature = "std")]
