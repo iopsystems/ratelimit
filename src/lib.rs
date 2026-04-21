@@ -33,10 +33,16 @@
 //! assert!(ratelimiter.try_wait().is_ok());
 //!
 //! // Sleep-wait loop
+//! use ratelimit::TryWaitError;
 //! let ratelimiter = Ratelimiter::new(100);
 //! for _ in 0..10 {
-//!     while let Err(wait) = ratelimiter.try_wait() {
-//!         std::thread::sleep(wait);
+//!     loop {
+//!         match ratelimiter.try_wait() {
+//!             Ok(()) => break,
+//!             Err(TryWaitError::Insufficient(wait)) => std::thread::sleep(wait),
+//!             Err(TryWaitError::ExceedsCapacity) => unreachable!("max_tokens > 0"),
+//!             Err(_) => unreachable!(),
+//!         }
 //!     }
 //!     // do some ratelimited action here
 //! }
@@ -438,40 +444,15 @@ where
 
     /// Non-blocking attempt to acquire a single token.
     ///
-    /// On success, one token has been consumed. On failure, returns a
-    /// `Duration` estimating when the next token will be available.
-    /// The returned duration is a lower-bound estimate; the next
-    /// `try_wait()` call after sleeping is not guaranteed to succeed
-    /// under concurrent load.
+    /// Equivalent to [`try_wait_n(1)`](Ratelimiter::try_wait_n). On success,
+    /// one token has been consumed. On failure, returns a [`TryWaitError`]
+    /// — either [`Insufficient`](TryWaitError::Insufficient) with a wait
+    /// duration, or [`ExceedsCapacity`](TryWaitError::ExceedsCapacity) if
+    /// `max_tokens` is currently 0 and waiting will not help.
     ///
     /// When the rate is 0 (unlimited), always succeeds.
-    pub fn try_wait(&self) -> Result<(), Duration> {
-        let rate = self.rate.load(Ordering::Relaxed);
-        if rate == 0 {
-            return Ok(());
-        }
-
-        self.refill();
-
-        let period_ns = self.period_ns.load(Ordering::Relaxed).max(1);
-        let cost = TOKEN_SCALE;
-        loop {
-            let current = self.tokens.load(Ordering::Acquire);
-            if current < cost {
-                let deficit = cost - current;
-                let wait_ns = wait_ns_for_deficit(deficit, rate, period_ns);
-                return Err(Duration::from_nanos(wait_ns));
-            }
-
-            if self
-                .tokens
-                .compare_exchange_weak(current, current - cost, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
-            core::hint::spin_loop();
-        }
+    pub fn try_wait(&self) -> Result<(), TryWaitError> {
+        self.try_wait_n(1)
     }
 
     /// Non-blocking attempt to atomically acquire `n` tokens.
@@ -811,7 +792,7 @@ mod tests {
         // No tokens available yet and not enough time passed
         let err = rl.try_wait().unwrap_err();
         // Should hint at ~1ms (1_000_000ns for 1000/s)
-        assert_eq!(err, Duration::from_micros(1000));
+        assert_eq!(err, TryWaitError::Insufficient(Duration::from_micros(1000)));
     }
 
     #[test]
@@ -851,7 +832,8 @@ mod tests {
         while clock.elapsed() < Duration::from_millis(100) {
             match rl.try_wait() {
                 Ok(()) => count += 1,
-                Err(wait) => clock.advance(wait),
+                Err(TryWaitError::Insufficient(wait)) => clock.advance(wait),
+                Err(e) => panic!("unexpected error: {e}"),
             }
         }
 
@@ -874,7 +856,10 @@ mod tests {
         // Verify the wait hint is at least 1ns even at very high rates
         let rl = Ratelimiter::with_clock(10_000_000_000, TestClock::new()); // 10B/s
         let err = rl.try_wait().unwrap_err();
-        assert!(err >= Duration::from_nanos(1));
+        let TryWaitError::Insufficient(wait) = err else {
+            panic!("expected Insufficient, got {err:?}");
+        };
+        assert!(wait >= Duration::from_nanos(1));
     }
 
     #[test]
@@ -922,8 +907,8 @@ mod tests {
         let rl = Ratelimiter::with_clock(1000, clock.clone());
         rl.set_max_tokens(0);
         clock.advance(Duration::from_millis(10));
-        // With max_tokens=0, no tokens can accumulate
-        assert!(rl.try_wait().is_err());
+        // With max_tokens=0, try_wait signals ExceedsCapacity (not a spinning Insufficient).
+        assert_eq!(rl.try_wait(), Err(TryWaitError::ExceedsCapacity));
         // Restore capacity
         rl.set_max_tokens(1000);
         clock.advance(Duration::from_millis(10));
@@ -1085,8 +1070,8 @@ mod tests {
             .build()
             .unwrap();
         // Empty bucket at 1/minute: next token ~60s away.
-        let wait = rl.try_wait().unwrap_err();
-        assert_eq!(wait, Duration::from_secs(60));
+        let err = rl.try_wait().unwrap_err();
+        assert_eq!(err, TryWaitError::Insufficient(Duration::from_secs(60)));
     }
 
     #[test]
