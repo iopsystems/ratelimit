@@ -55,7 +55,11 @@ jobs:
       - name: Bump to next dev version
         if: steps.check_tag.outputs.exists == 'false'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          # RELEASE_TOKEN (a PAT) is used for pushes so tag/branch pushes can
+          # trigger downstream workflows, but it lacks the pull_requests scope.
+          # gh pr create uses GITHUB_TOKEN, which has pull-requests: write from
+          # the job-level permissions block.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Calculate next dev version (patch bump + alpha.0)
           VERSION="${{ steps.version.outputs.version }}"
