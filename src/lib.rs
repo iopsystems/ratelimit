@@ -22,6 +22,12 @@
 //!     .build()
 //!     .unwrap();
 //!
+//! // Sub-Hz rates: 1 token per minute
+//! let ratelimiter = Ratelimiter::builder(1)
+//!     .period(std::time::Duration::from_secs(60))
+//!     .build()
+//!     .unwrap();
+//!
 //! // Rate of 0 means unlimited — try_wait() always succeeds
 //! let ratelimiter = Ratelimiter::new(0);
 //! assert!(ratelimiter.try_wait().is_ok());
@@ -106,6 +112,8 @@ pub enum Error {
     AvailableTokensTooHigh,
     #[error("max tokens must be at least 1")]
     MaxTokensTooLow,
+    #[error("period must be greater than zero")]
+    PeriodTooShort,
 }
 
 /// Failure modes for [`Ratelimiter::try_wait_n`].
@@ -124,8 +132,12 @@ pub enum TryWaitError {
 
 /// A lock-free token bucket ratelimiter.
 ///
-/// Tokens accumulate continuously based on elapsed time. Each `try_wait()`
-/// call consumes one token. A rate of 0 means unlimited (no rate limiting).
+/// Tokens accumulate continuously based on elapsed time at a rate of
+/// `rate` tokens per `period` — where `period` defaults to 1 second, so
+/// `rate` is interpreted as tokens per second unless otherwise configured.
+/// Set a longer `period` (via [`Builder::period`]) to express sub-Hz
+/// rates such as "1 token per minute". A `rate` of 0 means unlimited
+/// (no rate limiting).
 ///
 /// The `C` type parameter defaults to [`StdClock`] when the `std` feature
 /// is enabled, so `Ratelimiter` without generics resolves to the standard
@@ -133,8 +145,10 @@ pub enum TryWaitError {
 #[must_use]
 #[cfg(feature = "std")]
 pub struct Ratelimiter<C: Clock = StdClock> {
-    /// Target rate in tokens per second. 0 = unlimited.
+    /// Tokens added per `period_ns`. 0 = unlimited.
     rate: AtomicU64,
+    /// Length of the rate period in nanoseconds.
+    period_ns: AtomicU64,
     /// Maximum tokens (burst capacity) in real tokens.
     max_tokens: AtomicU64,
     /// Available tokens, scaled by TOKEN_SCALE for sub-token precision.
@@ -150,8 +164,10 @@ pub struct Ratelimiter<C: Clock = StdClock> {
 #[must_use]
 #[cfg(not(feature = "std"))]
 pub struct Ratelimiter<C: Clock> {
-    /// Target rate in tokens per second. 0 = unlimited.
+    /// Tokens added per `period_ns`. 0 = unlimited.
     rate: AtomicU64,
+    /// Length of the rate period in nanoseconds.
+    period_ns: AtomicU64,
     /// Maximum tokens (burst capacity) in real tokens.
     max_tokens: AtomicU64,
     /// Available tokens, scaled by TOKEN_SCALE for sub-token precision.
@@ -162,6 +178,20 @@ pub struct Ratelimiter<C: Clock> {
     last_refill_ns: AtomicU64,
     /// Clock for measuring elapsed time.
     clock: C,
+}
+
+/// Default rate period: one second.
+const DEFAULT_PERIOD_NS: u64 = 1_000_000_000;
+
+/// Estimate the wait time for `deficit` scaled tokens at `rate` tokens per
+/// `period_ns`. Result is clamped to at least 1ns and at most `u64::MAX` ns.
+#[inline]
+fn wait_ns_for_deficit(deficit: u64, rate: u64, period_ns: u64) -> u64 {
+    // wait_ns = deficit * period_ns / (rate * TOKEN_SCALE)
+    let denom = (rate as u128).saturating_mul(TOKEN_SCALE as u128).max(1);
+    ((deficit as u128).saturating_mul(period_ns as u128) / denom)
+        .max(1)
+        .min(u64::MAX as u128) as u64
 }
 
 #[cfg(feature = "std")]
@@ -226,6 +256,7 @@ where
     pub fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate: AtomicU64::new(rate),
+            period_ns: AtomicU64::new(DEFAULT_PERIOD_NS),
             max_tokens: AtomicU64::new(if rate == 0 { u64::MAX } else { rate }),
             tokens: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -239,12 +270,13 @@ where
         self.rate.load(Ordering::Relaxed)
     }
 
-    /// Set a new rate in tokens per second. Takes effect immediately.
+    /// Set a new rate (tokens per [`period`](Ratelimiter::period)). Takes
+    /// effect immediately.
     ///
     /// When setting rate to 0 (unlimited), `max_tokens` is set to `u64::MAX`.
     /// When setting a nonzero rate, if `max_tokens` is currently `u64::MAX`
-    /// (from unlimited mode or `new(0)`), it is reset to the new rate (1
-    /// second of burst). Otherwise `max_tokens` is left unchanged.
+    /// (from unlimited mode or `new(0)`), it is reset to the new rate (one
+    /// period of burst). Otherwise `max_tokens` is left unchanged.
     ///
     /// `max_tokens` is updated before `rate` so that concurrent readers
     /// never observe a nonzero rate with a stale `u64::MAX` max_tokens.
@@ -294,6 +326,28 @@ where
         }
     }
 
+    /// Returns the current rate period.
+    ///
+    /// The ratelimiter accumulates [`rate`](Ratelimiter::rate) tokens per
+    /// period. Defaults to one second.
+    pub fn period(&self) -> Duration {
+        Duration::from_nanos(self.period_ns.load(Ordering::Relaxed))
+    }
+
+    /// Set the rate period. Takes effect immediately.
+    ///
+    /// A longer period produces a slower effective rate. For example,
+    /// `rate = 1` with `period = Duration::from_secs(60)` is one token per
+    /// minute.
+    ///
+    /// A zero-length period is silently clamped to 1 nanosecond to avoid
+    /// division by zero — use [`Builder::period`] with a non-zero value at
+    /// construction to get a clear error instead.
+    pub fn set_period(&self, period: Duration) {
+        let ns = period.as_nanos().min(u64::MAX as u128) as u64;
+        self.period_ns.store(ns.max(1), Ordering::Release);
+    }
+
     /// Returns the approximate number of tokens currently available.
     ///
     /// This value is not updated automatically — tokens only accumulate
@@ -328,9 +382,13 @@ where
             return;
         }
 
-        // tokens = rate * (elapsed_ns / 1_000_000_000) * TOKEN_SCALE
-        //        = rate * elapsed_ns / 1_000
-        let new_tokens = (rate as u128 * elapsed_ns as u128 / 1_000).min(u64::MAX as u128) as u64;
+        // scaled_tokens = rate * TOKEN_SCALE * elapsed_ns / period_ns
+        let period_ns = self.period_ns.load(Ordering::Relaxed).max(1);
+        let new_tokens = ((rate as u128)
+            .saturating_mul(elapsed_ns as u128)
+            .saturating_mul(TOKEN_SCALE as u128)
+            / period_ns as u128)
+            .min(u64::MAX as u128) as u64;
 
         if new_tokens == 0 {
             return;
@@ -393,12 +451,13 @@ where
 
         self.refill();
 
+        let period_ns = self.period_ns.load(Ordering::Relaxed).max(1);
         let cost = TOKEN_SCALE;
         loop {
             let current = self.tokens.load(Ordering::Acquire);
             if current < cost {
                 let deficit = cost - current;
-                let wait_ns = (deficit as u128 * 1_000 / rate as u128).max(1) as u64;
+                let wait_ns = wait_ns_for_deficit(deficit, rate, period_ns);
                 return Err(Duration::from_nanos(wait_ns));
             }
 
@@ -444,12 +503,13 @@ where
 
         self.refill();
 
+        let period_ns = self.period_ns.load(Ordering::Relaxed).max(1);
         let cost = n.saturating_mul(TOKEN_SCALE);
         loop {
             let current = self.tokens.load(Ordering::Acquire);
             if current < cost {
                 let deficit = cost - current;
-                let wait_ns = (deficit as u128 * 1_000 / rate as u128).max(1) as u64;
+                let wait_ns = wait_ns_for_deficit(deficit, rate, period_ns);
                 return Err(TryWaitError::Insufficient(Duration::from_nanos(wait_ns)));
             }
 
@@ -480,6 +540,7 @@ where
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ratelimiter")
             .field("rate", &self.rate.load(Ordering::Relaxed))
+            .field("period", &self.period())
             .field("max_tokens", &self.max_tokens.load(Ordering::Relaxed))
             .field("available", &self.available())
             .finish()
@@ -495,6 +556,7 @@ where
 #[cfg(feature = "std")]
 pub struct Builder<C = StdClock> {
     rate: u64,
+    period: Duration,
     max_tokens: Option<u64>,
     initial_available: u64,
     clock: C,
@@ -505,6 +567,7 @@ pub struct Builder<C = StdClock> {
 #[cfg(not(feature = "std"))]
 pub struct Builder<C> {
     rate: u64,
+    period: Duration,
     max_tokens: Option<u64>,
     initial_available: u64,
     clock: C,
@@ -519,15 +582,29 @@ impl<C> Builder<C> {
     pub fn with_clock(rate: u64, clock: C) -> Self {
         Self {
             rate,
+            period: Duration::from_nanos(DEFAULT_PERIOD_NS),
             max_tokens: None,
             initial_available: 0,
             clock,
         }
     }
 
+    /// Set the period over which `rate` tokens accumulate.
+    ///
+    /// Defaults to one second, so `rate` is "tokens per second" by default.
+    /// Set a longer period to express sub-Hz rates — for example, `rate = 1`
+    /// with `period = Duration::from_secs(60)` is one token per minute.
+    ///
+    /// A zero-length period is rejected at [`build`](Builder::build) with
+    /// [`Error::PeriodTooShort`].
+    pub fn period(mut self, period: Duration) -> Self {
+        self.period = period;
+        self
+    }
+
     /// Set the maximum number of tokens (burst capacity).
     ///
-    /// Defaults to `rate` (1 second of burst), or `u64::MAX` when rate is 0
+    /// Defaults to `rate` (one period of burst), or `u64::MAX` when rate is 0
     /// (unlimited). Set higher for larger bursts or lower to restrict
     /// burstiness.
     pub fn max_tokens(mut self, tokens: u64) -> Self {
@@ -550,6 +627,12 @@ impl<C> Builder<C> {
     where
         C: Clock,
     {
+        let period_ns = self.period.as_nanos();
+        if period_ns == 0 {
+            return Err(Error::PeriodTooShort);
+        }
+        let period_ns = period_ns.min(u64::MAX as u128) as u64;
+
         let max_tokens =
             self.max_tokens
                 .unwrap_or(if self.rate == 0 { u64::MAX } else { self.rate });
@@ -564,6 +647,7 @@ impl<C> Builder<C> {
 
         Ok(Ratelimiter {
             rate: AtomicU64::new(self.rate),
+            period_ns: AtomicU64::new(period_ns),
             max_tokens: AtomicU64::new(max_tokens),
             tokens: AtomicU64::new(self.initial_available.saturating_mul(TOKEN_SCALE)),
             dropped: AtomicU64::new(0),
@@ -970,5 +1054,60 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(rl.try_wait_n(100), Err(TryWaitError::ExceedsCapacity));
+    }
+
+    // "1 token per minute" — sub-Hz rate expressed via a 60s period.
+    #[test]
+    fn sub_hz_refill() {
+        let clock = TestClock::new();
+        let rl = Builder::with_clock(1, clock.clone())
+            .period(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        // Not enough time — no token yet.
+        clock.advance(Duration::from_secs(30));
+        assert!(rl.try_wait().is_err());
+
+        // A full period should produce one token.
+        clock.advance(Duration::from_secs(30));
+        assert!(rl.try_wait().is_ok());
+        // And no second token without another full period.
+        assert!(rl.try_wait().is_err());
+    }
+
+    #[test]
+    fn sub_hz_wait_hint() {
+        let rl = Builder::with_clock(1, TestClock::new())
+            .period(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        // Empty bucket at 1/minute: next token ~60s away.
+        let wait = rl.try_wait().unwrap_err();
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn set_period_changes_rate() {
+        let clock = TestClock::new();
+        let rl = Ratelimiter::with_clock(1, clock.clone());
+        assert_eq!(rl.period(), Duration::from_secs(1));
+
+        // Stretch the period to 10s — now 1 token every 10s.
+        rl.set_period(Duration::from_secs(10));
+        assert_eq!(rl.period(), Duration::from_secs(10));
+
+        clock.advance(Duration::from_secs(5));
+        assert!(rl.try_wait().is_err());
+        clock.advance(Duration::from_secs(5));
+        assert!(rl.try_wait().is_ok());
+    }
+
+    #[test]
+    fn builder_error_period_zero() {
+        let result = Builder::with_clock(1, TestClock::new())
+            .period(Duration::ZERO)
+            .build();
+        assert!(matches!(result, Err(Error::PeriodTooShort)));
     }
 }
